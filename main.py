@@ -11,13 +11,13 @@ import sqlite3
 import os
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+import traceback
 
 # Initialize Flask app
 app = Flask(__name__)
 
 # Initialize clients using environment variables
-# (We'll set these in Railway)
 twilio_client = Client(
     os.environ.get('TWILIO_ACCOUNT_SID'),
     os.environ.get('TWILIO_AUTH_TOKEN')
@@ -30,9 +30,11 @@ TWILIO_PHONE_NUMBER = os.environ.get('TWILIO_PHONE_NUMBER')
 
 # Database setup
 def init_db():
-    """Create the database table if it doesn't exist."""
+    """Create the database tables if they don't exist."""
     conn = sqlite3.connect('memories.db')
     c = conn.cursor()
+    
+    # Main items table
     c.execute('''
         CREATE TABLE IF NOT EXISTS items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,6 +51,17 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
+    
+    # Pending URLs table - for URLs waiting for context
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS pending_urls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT NOT NULL,
+            sender TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -56,11 +69,68 @@ def init_db():
 init_db()
 
 
+def get_pending_url(sender: str) -> str | None:
+    """Check if there's a pending URL from this sender (within last 2 minutes)."""
+    conn = sqlite3.connect('memories.db')
+    c = conn.cursor()
+    
+    two_minutes_ago = datetime.now() - timedelta(minutes=2)
+    
+    c.execute('''
+        SELECT id, url FROM pending_urls 
+        WHERE sender = ? AND created_at > ?
+        ORDER BY created_at DESC LIMIT 1
+    ''', (sender, two_minutes_ago.isoformat()))
+    
+    row = c.fetchone()
+    
+    if row:
+        # Delete the pending URL since we're using it
+        c.execute('DELETE FROM pending_urls WHERE id = ?', (row[0],))
+        conn.commit()
+        conn.close()
+        return row[1]
+    
+    conn.close()
+    return None
+
+
+def save_pending_url(url: str, sender: str):
+    """Save a URL as pending, waiting for context."""
+    conn = sqlite3.connect('memories.db')
+    c = conn.cursor()
+    
+    # Clear any old pending URLs from this sender
+    c.execute('DELETE FROM pending_urls WHERE sender = ?', (sender,))
+    
+    # Save the new pending URL
+    c.execute('''
+        INSERT INTO pending_urls (url, sender) VALUES (?, ?)
+    ''', (url, sender))
+    
+    conn.commit()
+    conn.close()
+
+
+def is_url_only(message: str) -> tuple[bool, str | None]:
+    """Check if the message is just a URL (maybe with whitespace)."""
+    url_pattern = r'https?://[^\s]+'
+    urls = re.findall(url_pattern, message.strip())
+    
+    # If the message is basically just a URL
+    remaining = re.sub(url_pattern, '', message).strip()
+    if urls and len(remaining) < 5:  # Allow for minor whitespace/punctuation
+        return True, urls[0]
+    
+    return False, urls[0] if urls else None
+
+
 def classify_and_extract(message_body: str) -> dict:
     """
     Use Claude to classify the message and extract structured info.
     Categories: content, food, events, facts, or query
     """
+    print(f"Calling Claude API to classify: {message_body[:100]}...")
     
     prompt = f"""You are helping classify and extract information from text messages that users send to save things they find online.
 
@@ -87,31 +157,41 @@ For QUERY requests:
 
 Only include fields relevant to the category. If you can't determine something, use null."""
 
-    response = claude_client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    
-    # Parse the JSON response
     try:
-        result = json.loads(response.content[0].text)
+        response = claude_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        response_text = response.content[0].text
+        print(f"Claude API response: {response_text}")
+        
+        # Parse the JSON response
+        result = json.loads(response_text)
         return result
-    except json.JSONDecodeError:
+        
+    except json.JSONDecodeError as e:
+        print(f"JSON parse error: {e}")
         # If Claude didn't return valid JSON, treat as a fact
         return {"type": "save", "category": "facts", "caption": message_body}
+    except Exception as e:
+        print(f"Claude API error: {e}")
+        print(traceback.format_exc())
+        raise
 
 
-def save_item(data: dict, original_message: str, sender: str) -> str:
+def save_item(data: dict, original_message: str, sender: str, url_override: str = None) -> str:
     """Save an item to the database and return a confirmation message."""
+    print(f"Saving item: {data}")
     
     conn = sqlite3.connect('memories.db')
     c = conn.cursor()
     
-    # Extract URL from message if present
+    # Extract URL from message if present, or use override
     url_pattern = r'https?://[^\s]+'
     urls = re.findall(url_pattern, original_message)
-    original_url = urls[0] if urls else None
+    original_url = url_override or (urls[0] if urls else None)
     
     c.execute('''
         INSERT INTO items (category, title, platform, ingredients, location, event_date, caption, original_url, original_message, saved_by)
@@ -151,6 +231,7 @@ def save_item(data: dict, original_message: str, sender: str) -> str:
 
 def handle_query(question: str) -> str:
     """Search saved items and answer the user's question."""
+    print(f"Handling query: {question}")
     
     conn = sqlite3.connect('memories.db')
     c = conn.cursor()
@@ -182,38 +263,83 @@ IMPORTANT: When you recommend something, ALWAYS include the original_url if one 
 
 If nothing matches their question, let them know and suggest what categories they do have saved."""
 
-    response = claude_client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    
-    return response.content[0].text
+    try:
+        response = claude_client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        
+        return response.content[0].text
+        
+    except Exception as e:
+        print(f"Claude API error in query: {e}")
+        print(traceback.format_exc())
+        raise
 
 
 @app.route('/sms', methods=['POST'])
 def handle_sms():
     """Handle incoming SMS messages from Twilio."""
     
-    # Get the message details
-    message_body = request.form.get('Body', '')
-    sender = request.form.get('From', '')
-    
-    print(f"Received message from {sender}: {message_body}")
-    
-    # Classify and process the message
-    result = classify_and_extract(message_body)
-    
-    if result.get('type') == 'query':
-        response_text = handle_query(result.get('question', message_body))
-    else:
-        response_text = save_item(result, message_body, sender)
-    
-    # Send response back via TwiML
-    resp = MessagingResponse()
-    resp.message(response_text)
-    
-    return str(resp)
+    try:
+        # Get the message details
+        message_body = request.form.get('Body', '')
+        sender = request.form.get('From', '')
+        
+        print(f"=== NEW MESSAGE ===")
+        print(f"From: {sender}")
+        print(f"Body: {message_body}")
+        
+        # Check if this message contains a URL
+        is_url, url = is_url_only(message_body)
+        
+        if is_url:
+            # URL only (no meaningful text) - save as pending, brief acknowledgment
+            save_pending_url(url, sender)
+            print(f"Saved pending URL: {url}")
+            
+            resp = MessagingResponse()
+            resp.message("✓")
+            return str(resp)
+        
+        # This message has text (maybe with URL, maybe without)
+        # Check if there's a pending URL to combine with
+        pending_url = get_pending_url(sender)
+        
+        if pending_url:
+            # Combine the pending URL with this message
+            combined_message = f"{message_body} {pending_url}"
+            print(f"Combined with pending URL: {combined_message}")
+        else:
+            combined_message = message_body
+        
+        # Classify and process the message
+        result = classify_and_extract(combined_message)
+        print(f"Classification result: {result}")
+        
+        if result.get('type') == 'query':
+            response_text = handle_query(result.get('question', message_body))
+        else:
+            response_text = save_item(result, combined_message, sender, url_override=pending_url)
+        
+        print(f"Response: {response_text}")
+        
+        # Send response back via TwiML
+        resp = MessagingResponse()
+        resp.message(response_text)
+        
+        return str(resp)
+        
+    except Exception as e:
+        print(f"=== ERROR ===")
+        print(f"Error: {e}")
+        print(traceback.format_exc())
+        
+        # Still try to send an error response
+        resp = MessagingResponse()
+        resp.message("Sorry, something went wrong. Try again?")
+        return str(resp)
 
 
 @app.route('/', methods=['GET'])
